@@ -12,9 +12,7 @@ import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
 import android.view.View
-import android.view.ViewGroup
 import android.view.WindowInsets
-import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
@@ -22,6 +20,7 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.Spinner
 import android.widget.TextView
+import android.widget.Toast
 
 class MainActivity : Activity() {
 
@@ -29,15 +28,13 @@ class MainActivity : Activity() {
     private lateinit var button: Button
     private lateinit var progress: ProgressBar
     private lateinit var status: TextView
-    private lateinit var previewContainer: ViewGroup
+    private lateinit var previewContainer: android.view.ViewGroup
     private lateinit var changeView: Button
     private lateinit var grantOverlay: Button
     private lateinit var lockStatic: CheckBox
-    private var currentPreviewBitmap: Bitmap? = null
     private var leavingActivity = false
     private var latestDownloadRequestId = 0L
     private var uiDownloadActive = false
-
     private val refreshStateListener: (Boolean) -> Unit = { updating ->
         if (isActivityUsable()) {
             when {
@@ -49,11 +46,12 @@ class MainActivity : Activity() {
                         status.setText(R.string.loading)
                     }
                 }
-                else -> loadCachedImage()
+                else -> loadCachedImageAsync()
             }
         }
     }
 
+    /** Mantiene texto, color y accesibilidad del botón sincronizados con la descarga. */
     private enum class WallpaperButtonState { UPDATING, READY, UNAVAILABLE }
 
     private fun setWallpaperButtonState(state: WallpaperButtonState) {
@@ -95,6 +93,8 @@ class MainActivity : Activity() {
                 startActivity(
                     Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
                 )
+            }.onFailure {
+                Toast.makeText(this, R.string.setting_unavailable, Toast.LENGTH_SHORT).show()
             }
         }
         findViewById<Button>(R.id.grant_battery).setOnClickListener {
@@ -102,6 +102,8 @@ class MainActivity : Activity() {
                 startActivity(
                     Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
                 )
+            }.onFailure {
+                Toast.makeText(this, R.string.setting_unavailable, Toast.LENGTH_SHORT).show()
             }
         }
         if (Build.VERSION.SDK_INT >= 33 &&
@@ -110,7 +112,7 @@ class MainActivity : Activity() {
             requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 2001)
         }
         findViewById<Button>(R.id.refresh_now).setOnClickListener { startDownload() }
-        UnlockService.start(this)
+        UnlockService.start(this) // mantiene la app viva y escucha el desbloqueo aunque esté cerrada
         lockStatic.isChecked = WallpaperRepository.lockEnabled(this)
         lockStatic.setOnCheckedChangeListener { _, checked ->
             WallpaperRepository.setLockEnabled(this, checked)
@@ -118,13 +120,15 @@ class MainActivity : Activity() {
         }
 
         if (!WallpaperRepository.hasSelection(this)) {
-            openPicker()
+            // Primer inicio (solo si no es una recreación de actividad): elegir vista de Zoom Earth.
+            if (savedInstanceState == null) openPicker()
         } else {
-            loadCachedImage()
+            loadCachedImageAsync()
         }
     }
 
     private fun installUnlockIntervalSelector() {
+        // 0 significa actualizar en cada desbloqueo, sin intervalo mínimo.
         val options = listOf(0, 5, 10, 15, 30, 60, 120, 360, 720, 1440)
         val labels = options.map {
             when {
@@ -134,7 +138,7 @@ class MainActivity : Activity() {
                 else -> "${it / 60} horas"
             }
         }
-        val parent = lockStatic.parent as? ViewGroup ?: return
+        val parent = lockStatic.parent as? android.view.ViewGroup ?: return
         val index = parent.indexOfChild(lockStatic)
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -143,13 +147,10 @@ class MainActivity : Activity() {
         container.addView(TextView(this).apply { text = "Intervalo mínimo entre actualizaciones al desbloquear" })
         val spinner = Spinner(this)
         spinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, labels)
-        spinner.setSelection(
-            options.indexOf(WallpaperRepository.unlockIntervalMinutes(this)).takeIf { it >= 0 }
-                ?: options.indexOf(30)
-        )
-        spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
-            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+        spinner.setSelection(options.indexOf(WallpaperRepository.unlockIntervalMinutes(this)).takeIf { it >= 0 } ?: options.indexOf(30))
+        spinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
                 WallpaperRepository.setUnlockIntervalMinutes(this@MainActivity, options[position])
             }
         }
@@ -178,18 +179,14 @@ class MainActivity : Activity() {
         findViewById<TextView>(R.id.version).text = "Versión ${versionLabel()}"
         grantOverlay.visibility =
             if (Settings.canDrawOverlays(this)) View.GONE else View.VISIBLE
-        val pm = getSystemService(PowerManager::class.java)
-        val ignoring = pm?.isIgnoringBatteryOptimizations(packageName) == true
+        val ignoring = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
         findViewById<View>(R.id.grant_battery).visibility = if (ignoring) View.GONE else View.VISIBLE
         val log = WallpaperRepository.attemptLog(this)
         findViewById<TextView>(R.id.attempt_log).text =
-            if (log.isBlank()) "${versionLabel()} · sin intentos en segundo plano todavía."
-            else "${versionLabel()} · últimos intentos:
-$log"
+            if (log.isBlank()) "${versionLabel()} · sin intentos en segundo plano todavía." else "${versionLabel()} · últimos intentos:\n$log"
     }
 
     private fun openPicker() {
-        @Suppress("DEPRECATION")
         startActivityForResult(Intent(this, PickViewActivity::class.java), REQ_PICK)
     }
 
@@ -204,20 +201,28 @@ $log"
         if (requestCode != REQ_PICK) return
         val hasImage = WallpaperRepository.cacheFile(this).exists()
         if (resultCode == RESULT_OK) {
+            // Nueva zona: descarga inmediata, sin aplicar el intervalo de desbloqueo.
             startDownload("seleccion")
         } else if (hasImage) {
-            loadCachedImage()
+            loadCachedImageAsync()
         } else {
             showManualDownloadPrompt()
         }
     }
 
-    private fun loadCachedImage() {
-        val cached = runCatching { WallpaperRepository.loadCached(this) }.getOrNull()
-        if (cached != null) {
-            showImageSafely(cached)
-        } else {
-            showManualDownloadPrompt()
+    private fun loadCachedImageAsync(onMissing: (() -> Unit)? = null) {
+        WallpaperRepository.loadCachedAsync(this) { cached ->
+            if (!isActivityUsable()) {
+                cached?.recycle()
+                return@loadCachedAsync
+            }
+            if (cached != null) {
+                showImageSafely(cached)
+            } else if (onMissing != null) {
+                onMissing()
+            } else {
+                showManualDownloadPrompt()
+            }
         }
     }
 
@@ -230,9 +235,9 @@ $log"
 
     override fun onDestroy() {
         leavingActivity = true
-        preview.clearBitmap()
-        currentPreviewBitmap?.recycle()
-        currentPreviewBitmap = null
+        if (::preview.isInitialized) {
+            preview.clearBitmap()
+        }
         super.onDestroy()
     }
 
@@ -253,10 +258,12 @@ $log"
     }
 
     private fun startDownload(source: String = "manual") {
+        // Si ya se actualiza al desbloquear, no iniciamos una segunda descarga manual simultánea.
         if (source != "seleccion" && WallpaperRepository.isUpdating()) {
             setWallpaperButtonState(WallpaperButtonState.UPDATING)
             return
         }
+        // La última solicitud visual tiene prioridad; callbacks anteriores no restauran el naranja.
         val requestId = ++latestDownloadRequestId
         uiDownloadActive = true
         progress.visibility = View.VISIBLE
@@ -267,20 +274,31 @@ $log"
             if (!isActivityUsable() || requestId != latestDownloadRequestId) return@captureNow
             uiDownloadActive = false
             progress.visibility = View.GONE
-            val bmp = runCatching { WallpaperRepository.loadCached(this) }.getOrNull()
-            if (bmp != null) {
-                showImageSafely(bmp)
-                if (!ok) {
-                    status.visibility = View.VISIBLE
-                    status.setText(R.string.kept_previous_image)
-                    setWallpaperButtonState(WallpaperButtonState.READY)
+            // Aunque la descarga haya fallado, mostrar el JPG anterior y permitir usarlo.
+            WallpaperRepository.loadCachedAsync(this) { bmp ->
+                if (!isActivityUsable() || requestId != latestDownloadRequestId) {
+                    bmp?.recycle()
+                    return@loadCachedAsync
                 }
-            } else {
-                showError()
+                if (bmp != null) {
+                    showImageSafely(bmp)
+                    if (!ok) {
+                        status.visibility = View.VISIBLE
+                        status.setText(R.string.kept_previous_image)
+                        // La imagen anterior sigue disponible para usar como fondo.
+                        setWallpaperButtonState(WallpaperButtonState.READY)
+                    }
+                } else {
+                    showError()
+                }
             }
         }
     }
 
+    /**
+     * Captura con el mismo método que el fondo en segundo plano (imagen del tamaño y proporción de la
+     * pantalla). Si falla y [fallbackToWindow], reintenta con el WebView visible dentro de la app.
+     */
     private fun captureNow(
         fallbackToWindow: Boolean,
         source: String,
@@ -292,6 +310,7 @@ $log"
             if (ok || !fallbackToWindow) {
                 onDone(ok)
             } else {
+                // El WebView visible puede recuperar una captura fallida; el botón continúa gris.
                 progress.visibility = View.GONE
                 status.visibility = View.GONE
                 WallpaperRepository.refresh(
@@ -303,9 +322,9 @@ $log"
         }
     }
 
+    /** Muestra la imagen a pantalla completa con Aceptar / Cancelar antes de aplicar el fondo. */
     private fun openConfirm() {
         WallpaperRepository.saveState(this, preview.state)
-        @Suppress("DEPRECATION")
         startActivityForResult(Intent(this, ConfirmWallpaperActivity::class.java), REQ_CONFIRM)
     }
 
@@ -313,14 +332,12 @@ $log"
         try {
             showImage(bitmap)
         } catch (t: Throwable) {
-            bitmap.recycle()
+            if (!bitmap.isRecycled) bitmap.recycle()
             showError()
         }
     }
 
     private fun showImage(bitmap: Bitmap) {
-        val old = currentPreviewBitmap
-        currentPreviewBitmap = bitmap
         progress.visibility = View.GONE
         status.visibility = View.GONE
         preview.setBitmap(
@@ -328,9 +345,6 @@ $log"
             WallpaperRepository.loadState(this),
             WallpaperRepository.updatedAt(this)
         )
-        if (old != null && old !== bitmap && !old.isRecycled) {
-            old.recycle()
-        }
         setWallpaperButtonState(
             if (uiDownloadActive || WallpaperRepository.isUpdating()) WallpaperButtonState.UPDATING
             else WallpaperButtonState.READY
@@ -343,12 +357,8 @@ $log"
         status.visibility = View.VISIBLE
         val reason = WallpaperRepository.lastError
         status.text = getString(R.string.download_error) +
-            (if (reason != null) "
-
-Motivo: $reason" else "") +
-            "
-
-" + getString(R.string.tap_retry)
+            (if (reason != null) "\n\nMotivo: $reason" else "") +
+            "\n\n" + getString(R.string.tap_retry)
         setWallpaperButtonState(
             if (uiDownloadActive || WallpaperRepository.isUpdating()) WallpaperButtonState.UPDATING
             else WallpaperButtonState.UNAVAILABLE
@@ -364,10 +374,14 @@ Motivo: $reason" else "") +
         val intent = Intent("android.service.wallpaper.CHANGE_LIVE_WALLPAPER").apply {
             putExtra("android.service.wallpaper.extra.LIVE_WALLPAPER_COMPONENT", component)
         }
-        try {
+        runCatching {
             startActivity(intent)
-        } catch (t: Throwable) {
-            startActivity(Intent("android.service.wallpaper.LIVE_WALLPAPER_CHOOSER"))
+        }.onFailure {
+            runCatching {
+                startActivity(Intent("android.service.wallpaper.LIVE_WALLPAPER_CHOOSER"))
+            }.onFailure {
+                Toast.makeText(this, R.string.live_wallpaper_unsupported, Toast.LENGTH_LONG).show()
+            }
         }
     }
 

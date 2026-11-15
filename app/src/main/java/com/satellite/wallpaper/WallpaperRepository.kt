@@ -35,16 +35,22 @@ object WallpaperRepository {
     private const val KEY_LOCK_STATIC = "lock_static"
     private const val KEY_LOG = "attempt_log"
 
-    private const val WATCHDOG_MS = 180_000L
+    /** Si una captura no termina en este tiempo se libera el bloqueo para no quedar atascados. */
+    private const val WATCHDOG_MS = 300_000L
 
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     private val running = AtomicBoolean(false)
+    /** Un único lector/escritor de la caché durante la sustitución atómica. */
     private val cacheLock = Any()
     @Volatile private var runToken = 0L
-    private var activeWatchdog: Runnable? = null
+    // Se modifica en el hilo principal: conserva desbloqueos que llegan durante otra captura.
     private var pendingUnlocks = 0
+    // Los cambios de zona tienen prioridad sobre un desbloqueo en curso.
     private var pendingSelection: ((Boolean) -> Unit)? = null
+
+    // Observadores del estado de actualización mientras la pantalla principal está visible.
+    // Todas las altas, bajas y notificaciones se gestionan en el hilo principal.
     private val refreshStateListeners = mutableSetOf<(Boolean) -> Unit>()
 
     fun isUpdating(): Boolean = running.get() || pendingSelection != null || pendingUnlocks > 0
@@ -67,6 +73,7 @@ object WallpaperRepository {
         }
     }
 
+    /** Motivo del último fallo de captura (null si la última fue correcta). */
     @Volatile
     var lastError: String? = null
         private set
@@ -75,17 +82,24 @@ object WallpaperRepository {
 
     fun cacheFile(context: Context): File = File(context.filesDir, CACHE_NAME)
 
+    // ---------- Selección de vista (recordada) ----------
+
+    /** true si el usuario ya eligió una vista de Zoom Earth. */
     fun hasSelection(context: Context): Boolean = prefs(context).contains(KEY_VIEW_URL)
 
+    /** URL de Zoom Earth elegida por el usuario (o la de por defecto). */
     fun viewUrl(context: Context): String =
         prefs(context).getString(KEY_VIEW_URL, null) ?: ZoomEarthCapture.PAGE_URL
 
+    /** Guarda la vista elegida. Si cambia, invalida la imagen en caché y el encuadre. */
     fun saveViewUrl(context: Context, url: String) {
         val p = prefs(context)
         val changed = p.getString(KEY_VIEW_URL, null) != url
         val e = p.edit().putString(KEY_VIEW_URL, url)
         if (changed) {
             e.remove(KEY_UPDATED_AT).remove(KEY_ZOOM).remove(KEY_OFFSET_X).remove(KEY_OFFSET_Y)
+            // Conservamos la imagen previa hasta terminar correctamente la nueva captura.
+            // Una descarga antigua no podrá reemplazar la nueva zona (comprobación en done).
         }
         e.apply()
     }
@@ -99,6 +113,8 @@ object WallpaperRepository {
 
     fun refreshOnUnlock(context: Context) {
         val interval = unlockIntervalMinutes(context)
+        // "Sin esperas": cada desbloqueo real debe provocar una captura aunque
+        // la imagen anterior se haya descargado hace segundos.
         refresh(
             context,
             force = interval == 0,
@@ -113,38 +129,32 @@ object WallpaperRepository {
         prefs(context).edit().putBoolean(KEY_LOCK_STATIC, value).apply()
     }
 
+    // ---------- Caché / encuadre ----------
+
     fun updatedAt(context: Context): Long {
         val v = prefs(context).getLong(KEY_UPDATED_AT, 0L)
         return if (v > 0) v else cacheFile(context).lastModified()
     }
 
     fun loadCached(context: Context): Bitmap? = synchronized(cacheLock) {
-        val file = cacheFile(context)
-        val atomic = AtomicFile(file)
-        val (sw, sh) = ScreenSize.real(context)
-        val maxDim = maxOf(sw, sh, 1080) * 2
-
-        val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        runCatching {
-            atomic.openRead().use { BitmapFactory.decodeStream(it, null, boundsOpts) }
-        }.getOrNull() ?: return@synchronized null
-
-        var sampleSize = 1
-        while (boundsOpts.outWidth / sampleSize > maxDim || boundsOpts.outHeight / sampleSize > maxDim) {
-            sampleSize *= 2
-        }
-
-        val decodeOpts = BitmapFactory.Options().apply {
-            inSampleSize = sampleSize
-            inPreferredConfig = Bitmap.Config.RGB_565
-        }
+        // AtomicFile.openRead() recupera también una copia anterior si hubo un
+        // cierre inesperado mientras se sustituía el JPG.
         val bmp = runCatching {
-            atomic.openRead().use { BitmapFactory.decodeStream(it, null, decodeOpts) }
+            AtomicFile(cacheFile(context)).openRead().use { BitmapFactory.decodeStream(it) }
         }.getOrNull() ?: return@synchronized null
-
         if (SatelliteImageValidator.isUsable(bmp)) bmp else {
-            bmp.recycle()
+            if (!bmp.isRecycled) bmp.recycle()
+            // No borrar la caché: la última imagen válida nunca se elimina por un error de lectura.
             null
+        }
+    }
+
+    /** Decodifica y valida la imagen en caché en segundo plano, entregando el resultado en el hilo principal. */
+    fun loadCachedAsync(context: Context, onLoaded: (Bitmap?) -> Unit) {
+        val app = context.applicationContext
+        executor.execute {
+            val bmp = runCatching { loadCached(app) }.getOrNull()
+            main.post { onLoaded(bmp) }
         }
     }
 
@@ -166,19 +176,29 @@ object WallpaperRepository {
             .apply()
     }
 
+    // ---------- Registro de intentos (diagnóstico) ----------
+
     @Synchronized
     fun note(context: Context, source: String, text: String) {
         val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-        val old = prefs(context).getString(KEY_LOG, "")!!.split("
-").filter { it.isNotBlank() }
-        val log = (old + "$time · $source · $text").takeLast(10).joinToString("
-")
+        val old = prefs(context).getString(KEY_LOG, "")!!.split("\n").filter { it.isNotBlank() }
+        val log = (old + "$time · $source · $text").takeLast(10).joinToString("\n")
         prefs(context).edit().putString(KEY_LOG, log).apply()
         Log.i(TAG, "$source: $text")
     }
 
+    /** Últimos intentos de descarga (más reciente al final). */
     fun attemptLog(context: Context): String = prefs(context).getString(KEY_LOG, "")!!
 
+    // ---------- Descarga ----------
+
+    /**
+     * Captura la vista elegida de Zoom Earth y actualiza la caché (y la pantalla de bloqueo).
+     * force = false: no hace nada si la caché tiene menos de [minAgeMs], cuando se indica un intervalo.
+     * host != null: captura con el WebView visible dentro de ese contenedor (modo fiable).
+     * host == null: captura en segundo plano (cascada de estrategias).
+     * callback(true) solo si se generó una imagen nueva; se invoca en el hilo principal.
+     */
     fun refresh(
         context: Context,
         force: Boolean = false,
@@ -193,17 +213,12 @@ object WallpaperRepository {
             val fresh = cacheFile(app).exists() && ageMs <= minAgeMs
             if (!force && fresh) {
                 note(app, source, "omitido: la imagen es de hace ${ageMs / 1000} s (mínimo ${minAgeMs / 1000} s)")
-                callback(false)
-                return@post
-            }
-            if (!UnlockRefreshCoordinator.isNetworkAvailable(app)) {
-                lastError = "Sin conexión a internet"
-                note(app, source, "omitido: sin conexión a internet")
-                callback(false)
-                return@post
+                callback(false); return@post
             }
             if (!running.compareAndSet(false, true)) {
                 if (source == "seleccion") {
+                    // No se descarta: se ejecuta en cuanto termine la captura actual.
+                    // Solo importa la última zona elegida.
                     pendingSelection?.invoke(false)
                     pendingSelection = callback
                     notifyRefreshStateListeners()
@@ -216,43 +231,35 @@ object WallpaperRepository {
                 } else {
                     note(app, source, "omitido: ya hay una descarga en curso")
                 }
-                callback(false)
-                return@post
+                callback(false); return@post
             }
-
-            executor.execute { cleanupOrphanDownloads(app) }
-
             val token = System.nanoTime()
             runToken = token
             notifyRefreshStateListeners()
             note(app, source, "iniciando captura (${if (host != null) "WebView visible" else "segundo plano"})")
 
-            activeWatchdog?.let { main.removeCallbacks(it) }
-            val watchdog = Runnable {
+            // Red de seguridad: si la captura no termina nunca, se libera el bloqueo.
+            main.postDelayed({
                 if (runToken == token) {
                     runToken = 0L
-                    activeWatchdog = null
                     running.set(false)
                     note(app, source, "FALLO: la captura no terminó en ${WATCHDOG_MS / 1000} s; se libera el bloqueo")
                     notifyRefreshStateListeners()
                     callback(false)
                     startNextPendingSelectionOrUnlock(app)
                 }
-            }
-            activeWatchdog = watchdog
-            main.postDelayed(watchdog, WATCHDOG_MS)
+            }, WATCHDOG_MS)
 
             val selectedUrl = viewUrl(app)
             val tmp = File(app.filesDir, "$CACHE_NAME.$token.download")
             val done: (String?) -> Unit = { error ->
                 executor.execute {
+                    // Nunca guardamos una imagen de la zona anterior después de cambiarla.
                     val validSelection = selectedUrl == viewUrl(app)
                     val ok = error == null && validSelection && runToken == token && commit(app, tmp)
                     if (!ok) runCatching { tmp.delete() }
                     main.post {
-                        if (runToken != token) return@post
-                        activeWatchdog?.let { main.removeCallbacks(it) }
-                        activeWatchdog = null
+                        if (runToken != token) return@post // el vigilante ya liberó esta captura
                         runToken = 0L
                         running.set(false)
                         lastError = if (ok) null else (error
@@ -261,6 +268,7 @@ object WallpaperRepository {
                         notifyRefreshStateListeners()
                         callback(ok)
                         if (ok) {
+                            // Primero se repinta el fondo animado; la pantalla de bloqueo estática después.
                             app.sendBroadcast(
                                 Intent(SatelliteWallpaperService.ACTION_CACHE_UPDATED)
                                     .setPackage(app.packageName)
@@ -280,18 +288,7 @@ object WallpaperRepository {
         }
     }
 
-    private fun cleanupOrphanDownloads(app: Context) {
-        runCatching {
-            app.filesDir.listFiles { _, name ->
-                name.startsWith("$CACHE_NAME.") && name.endsWith(".download")
-            }?.forEach { file ->
-                if (System.currentTimeMillis() - file.lastModified() > 60_000L) {
-                    file.delete()
-                }
-            }
-        }
-    }
-
+    /** Prioriza la última zona seleccionada y después atiende los desbloqueos pendientes. */
     private fun startNextPendingSelectionOrUnlock(app: Context) {
         if (running.get()) return
         val callback = pendingSelection
@@ -306,13 +303,18 @@ object WallpaperRepository {
         }
     }
 
+    /**
+     * Pinta la imagen encuadrada (con fecha y hora) como fondo ESTÁTICO de la pantalla de bloqueo.
+     * Garantiza que el bloqueo se actualice aunque el launcher no muestre el fondo animado ahí.
+     */
     fun applyLockScreen(context: Context) {
         if (Build.VERSION.SDK_INT < 24) return
         val app = context.applicationContext
         val src = loadCached(app) ?: return
-        val (sw, sh) = ScreenSize.real(app)
-        val out = Bitmap.createBitmap(sw, sh, Bitmap.Config.ARGB_8888)
+        var out: Bitmap? = null
         try {
+            val (sw, sh) = ScreenSize.real(app)
+            out = Bitmap.createBitmap(sw, sh, Bitmap.Config.ARGB_8888)
             val c = Canvas(out)
             c.drawColor(0xFF10212B.toInt())
             CropMath.draw(c, src, out.width, out.height, loadState(app))
@@ -322,8 +324,8 @@ object WallpaperRepository {
         } catch (t: Throwable) {
             Log.w(TAG, "applyLockScreen", t)
         } finally {
-            src.recycle()
-            out.recycle()
+            if (!src.isRecycled) src.recycle()
+            if (out != null && !out.isRecycled) out.recycle()
         }
     }
 
@@ -333,10 +335,16 @@ object WallpaperRepository {
     }
 
     private fun commit(app: Context, tmp: File): Boolean = try {
+        // Verificar también el JPEG temporal antes de reemplazar el último bueno:
+        // una captura de Chrome con texto negro sobre fondo blanco es decodificable.
         val opts = BitmapFactory.Options().apply { inSampleSize = 4 }
         val candidate = BitmapFactory.decodeFile(tmp.absolutePath, opts)
             ?: throw IllegalStateException("JPEG temporal ilegible")
-        val usable = try { SatelliteImageValidator.isUsable(candidate) } finally { candidate.recycle() }
+        val usable = try {
+            SatelliteImageValidator.isUsable(candidate)
+        } finally {
+            if (!candidate.isRecycled) candidate.recycle()
+        }
         check(usable) { "La captura es una pantalla en blanco o un error web" }
         synchronized(cacheLock) {
             val atomic = AtomicFile(cacheFile(app))
@@ -352,6 +360,7 @@ object WallpaperRepository {
                 throw t
             }
         }
+        // Actualizar la hora únicamente después de confirmar el reemplazo.
         prefs(app).edit().putLong(KEY_UPDATED_AT, System.currentTimeMillis()).apply()
         true
     } catch (t: Throwable) {
